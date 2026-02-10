@@ -5,3 +5,6 @@ requests
 pandas
 pydantic
 tableauhyperapi
+azure-storage-blob
+
+
