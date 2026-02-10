@@ -435,8 +435,16 @@ def migrate_static(folder_name: str, target_workspace_id: str):
         os.remove(twbx_path)
 
         # Use extracted relationships if available, else fallback to STATIC_RELATIONSHIPS
-        relationships_metadata = metadata.get("relationships") or STATIC_RELATIONSHIPS
-        log.info(f"Using {len(relationships_metadata)} relationships")
+        # relationships_metadata = metadata.get("relationships") or STATIC_RELATIONSHIPS
+        # log.info(f"Using {len(relationships_metadata)} relationships")
+        relationships_metadata = metadata.get("relationships")
+        if relationships_metadata:
+            log.info(f"✅ Extracted {len(relationships_metadata)} relationships from TWBX:")
+            for r in relationships_metadata:
+                log.info(f"  {r['fromTable']}.{r['fromColumn']} -> {r['toTable']}.{r['toColumn']}")
+        else:
+            log.warning("⚠️ No relationships found in TWBX. Using fallback static relationships.")
+            relationships_metadata = STATIC_RELATIONSHIPS
 
         # ----------------------------------------------------
         # 3. READ CSVs FROM AZURE BLOB
