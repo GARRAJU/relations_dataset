@@ -337,6 +337,27 @@ app.add_middleware(
 )
 
 # ============================================================
+# STATIC RELATIONSHIPS (fallback)
+# ============================================================
+
+STATIC_RELATIONSHIPS = [
+    {
+        "fromTable": "products",
+        "fromColumn": "ProductID",
+        "toTable": "sales",
+        "toColumn": "ProductID",
+        "relationshipType": "Many-to-One"
+    },
+    {
+        "fromTable": "sales",
+        "fromColumn": "CustomerID",
+        "toTable": "customers",
+        "toColumn": "CustomerID",
+        "relationshipType": "Many-to-One"
+    }
+]
+
+# ============================================================
 # HELPERS
 # ============================================================
 
@@ -392,8 +413,9 @@ def download_twbx_from_blob(folder_name: str) -> str:
         log.error(f"Failed to download TWBX: {str(e)}")
         raise Exception(f"TWBX file not found: {twbx_blob_name}")
 
+
 # ============================================================
-# MIGRATION API - FIXED
+# MIGRATION API - UPDATED WITH STATIC RELATIONSHIPS
 # ============================================================
 
 @app.post("/migrate-static")
@@ -412,8 +434,9 @@ def migrate_static(folder_name: str, target_workspace_id: str):
         metadata = extract_metadata_from_twbx(twbx_path)
         os.remove(twbx_path)
 
-        relationships_metadata = metadata.get("relationships", [])
-        log.info(f"Extracted {len(relationships_metadata)} Tableau relationships")
+        # Use extracted relationships if available, else fallback to STATIC_RELATIONSHIPS
+        relationships_metadata = metadata.get("relationships") or STATIC_RELATIONSHIPS
+        log.info(f"Using {len(relationships_metadata)} relationships")
 
         # ----------------------------------------------------
         # 3. READ CSVs FROM AZURE BLOB
@@ -426,92 +449,61 @@ def migrate_static(folder_name: str, target_workspace_id: str):
         blob_tables = {}
         prefix = f"{folder_name.rstrip('/')}/"
 
-        # Build valid tables set from relationships
         valid_tables = set()
-        if relationships_metadata:
-            for r in relationships_metadata:
-                valid_tables.add(r["fromTable"])
-                valid_tables.add(r["toTable"])
-            log.info(f"Valid tables from relationships: {valid_tables}")
-        else:
-            log.warning("No relationships found - will load ALL CSV files in folder")
+        for r in relationships_metadata:
+            valid_tables.add(r["fromTable"])
+            valid_tables.add(r["toTable"])
+        log.info(f"Valid tables from relationships: {valid_tables}")
 
-        # List all blobs with the folder prefix
         all_blobs = list(container.list_blobs(name_starts_with=prefix))
         log.info(f"Found {len(all_blobs)} blobs with prefix '{prefix}'")
 
         for blob in all_blobs:
             filename = os.path.basename(blob.name)
-            log.info(f"Processing blob: {blob.name}")
-
             if not filename.lower().endswith(".csv"):
-                log.info(f"  Skipping (not CSV): {filename}")
                 continue
 
             table_name = extract_second_word_table_name(filename)
-            log.info(f"  Extracted table name: {table_name}")
-
-            # If we have relationships, only load tables that are in relationships
-            # If no relationships, load ALL CSV files
-            if valid_tables and table_name not in valid_tables:
-                log.info(f"  Skipping (not in relationships): {table_name}")
+            if table_name not in valid_tables:
                 continue
 
             try:
                 data = container.download_blob(blob.name).readall()
                 blob_tables[table_name] = pd.read_csv(pd.io.common.BytesIO(data))
-                log.info(f"  ✅ Loaded table: {table_name} ({len(blob_tables[table_name])} rows, {len(blob_tables[table_name].columns)} columns)")
+                log.info(f"Loaded table: {table_name}")
             except Exception as e:
-                log.error(f"  ❌ Failed to load {table_name}: {str(e)}")
-                continue
+                log.error(f"Failed to load {table_name}: {str(e)}")
 
         if not blob_tables:
-            raise Exception(f"No CSV files found in folder: {prefix}")
-
-        log.info(f"Total tables loaded: {list(blob_tables.keys())}")
+            raise Exception(f"No CSV tables loaded for folder: {prefix}")
 
         # ----------------------------------------------------
-        # 4. BUILD POWER BI RELATIONSHIPS (if any exist)
+        # 4. BUILD POWER BI RELATIONSHIPS
         # ----------------------------------------------------
         pbi_relationships = []
-        if relationships_metadata:
-            for r in relationships_metadata:
-                # Only add relationship if both tables were loaded
-                if r["fromTable"] in blob_tables and r["toTable"] in blob_tables:
-                    pbi_relationships.append({
-                        "name": f"{r['fromTable']}_{r['toTable']}",
-                        "fromTable": r["fromTable"],
-                        "fromColumn": r["fromColumn"],
-                        "toTable": r["toTable"],
-                        "toColumn": r["toColumn"],
-                        "crossFilteringBehavior": "BothDirections",
-                    })
-                else:
-                    log.warning(f"Skipping relationship {r['fromTable']}.{r['fromColumn']} -> {r['toTable']}.{r['toColumn']} (tables not loaded)")
-
-            log.info(f"Built {len(pbi_relationships)} Power BI relationships")
-        else:
-            log.warning("No relationships to create")
+        for r in relationships_metadata:
+            if r["fromTable"] in blob_tables and r["toTable"] in blob_tables:
+                pbi_relationships.append({
+                    "name": f"{r['fromTable']}_{r['toTable']}",
+                    "fromTable": r["fromTable"],
+                    "fromColumn": r["fromColumn"],
+                    "toTable": r["toTable"],
+                    "toColumn": r["toColumn"],
+                    "crossFilteringBehavior": "BothDirections",
+                })
 
         # ----------------------------------------------------
-        # 5. DEFINE DATASET
+        # 5. CREATE DATASET
         # ----------------------------------------------------
         dataset_payload = {
             "name": f"{REPORT_NAME}_DS",
             "tables": [],
+            "relationships": pbi_relationships if pbi_relationships else None,
+            "defaultMode": "Push",
         }
-
-        # Only add relationships if we have any
-        if pbi_relationships:
-            dataset_payload["defaultMode"] = "Push"
-            dataset_payload["relationships"] = pbi_relationships
-            log.info("Creating dataset WITH relationships")
-        else:
-            log.info("Creating dataset WITHOUT relationships")
 
         for table_name, df in blob_tables.items():
             columns = []
-
             for col in df.columns:
                 if "id" in col.lower():
                     dtype, summarize = "Int64", "none"
@@ -533,12 +525,6 @@ def migrate_static(folder_name: str, target_workspace_id: str):
                 "columns": columns,
             })
 
-        # ----------------------------------------------------
-        # 6. CREATE DATASET
-        # ----------------------------------------------------
-        log.info("Creating dataset...")
-        log.info(f"Payload: {json.dumps(dataset_payload, indent=2)}")
-        
         ds_resp = requests.post(
             f"{POWERBI_API}/groups/{target_workspace_id}/datasets",
             headers={
@@ -547,47 +533,16 @@ def migrate_static(folder_name: str, target_workspace_id: str):
             },
             json=dataset_payload,
         )
-        
-        log.info(f"Response Status: {ds_resp.status_code}")
-        log.info(f"Response Body: {ds_resp.text}")
-        
-        # If failed with relationships, try without
-        if not ds_resp.ok and pbi_relationships:
-            log.warning("Dataset creation failed with relationships, retrying without...")
-            
-            dataset_payload_no_rel = {
-                "name": f"{REPORT_NAME}_DS",
-                "tables": dataset_payload["tables"],
-            }
-            
-            ds_resp = requests.post(
-                f"{POWERBI_API}/groups/{target_workspace_id}/datasets",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json"
-                },
-                json=dataset_payload_no_rel,
-            )
-            
-            log.info(f"Retry Status: {ds_resp.status_code}")
-            log.info(f"Retry Response: {ds_resp.text}")
-        
         ds_resp.raise_for_status()
-
         dataset_id = ds_resp.json()["id"]
         log.info(f"✅ Dataset created: {dataset_id}")
 
         # ----------------------------------------------------
-        # 7. PUSH DATA
+        # 6. PUSH DATA
         # ----------------------------------------------------
         time.sleep(5)
-
         for table_name, df in blob_tables.items():
-            df_clean = df.where(pd.notnull(df), None)
-            rows = df_clean.to_dict(orient="records")
-
-            log.info(f"Pushing {len(rows)} rows to {table_name}")
-
+            rows = df.where(pd.notnull(df), None).to_dict(orient="records")
             for i in range(0, len(rows), 2500):
                 requests.post(
                     f"{POWERBI_API}/groups/{target_workspace_id}/datasets/{dataset_id}/tables/{table_name}/rows",
@@ -597,11 +552,10 @@ def migrate_static(folder_name: str, target_workspace_id: str):
                     },
                     json={"rows": rows[i:i + 2500]},
                 ).raise_for_status()
-
-            log.info(f"✅ Pushed {len(rows)} rows into {table_name}")
+            log.info(f"Pushed {len(rows)} rows into {table_name}")
 
         # ----------------------------------------------------
-        # 8. CLONE REPORT
+        # 7. CLONE REPORT
         # ----------------------------------------------------
         clone_resp = requests.post(
             f"{POWERBI_API}/groups/{TEMPLATE_WORKSPACE_ID}/reports/{TEMPLATE_REPORT_ID}/Clone",
@@ -617,8 +571,6 @@ def migrate_static(folder_name: str, target_workspace_id: str):
         )
         clone_resp.raise_for_status()
 
-        log.info("✅ Migration completed successfully!")
-
         return {
             "status": "SUCCESS",
             "dataset_id": dataset_id,
@@ -626,7 +578,7 @@ def migrate_static(folder_name: str, target_workspace_id: str):
             "tables_migrated": list(blob_tables.keys()),
             "relationships_created": len(pbi_relationships) > 0,
             "relationships": relationships_metadata,
-            "message": "TWBX metadata + data migrated successfully",
+            "message": "TWBX metadata + data migrated successfully with static relationships"
         }
 
     except Exception as e:
