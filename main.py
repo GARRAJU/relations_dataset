@@ -190,7 +190,7 @@ def migrate_static(folder_name: str, target_workspace_id: str):
         # ----------------------------------------------------
         dataset_payload = {
             "name": f"{REPORT_NAME}_DS",
-            "defaultMode": "Push",
+            # "defaultMode": "Push",
             "tables": [],
             "relationships": pbi_relationships,
         }
@@ -211,7 +211,7 @@ def migrate_static(folder_name: str, target_workspace_id: str):
                 columns.append({
                     "name": col,
                     "dataType": dtype,
-                    "summarizeBy": summarize,
+                    # "summarizeBy": summarize,
                 })
 
             dataset_payload["tables"].append({
