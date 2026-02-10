@@ -415,7 +415,7 @@ def download_twbx_from_blob(folder_name: str) -> str:
 
 
 # ============================================================
-# MIGRATION API - UPDATED WITH STATIC RELATIONSHIPS
+# MIGRATION API - UPDATED WITH EXTRACTOR RELATIONSHIPS
 # ============================================================
 
 @app.post("/migrate-static")
@@ -578,7 +578,7 @@ def migrate_static(folder_name: str, target_workspace_id: str):
             "tables_migrated": list(blob_tables.keys()),
             "relationships_created": len(pbi_relationships) > 0,
             "relationships": relationships_metadata,
-            "message": "TWBX metadata + data migrated successfully with static relationships"
+            "message": "TWBX metadata + data migrated successfully with extracted relationships"
         }
 
     except Exception as e:
