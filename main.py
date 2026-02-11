@@ -660,330 +660,190 @@ app.add_middleware(
 )
 
 # ============================================================
-# ENHANCED EXTRACTOR LOGIC
+# EXTRACTOR LOGIC (WORKING VERSION FROM LOCAL)
 # ============================================================
 
 def strip_ns(root: ET.Element):
-    """Remove XML namespaces from all elements"""
+    """Remove XML namespaces"""
     for el in root.iter():
         if "}" in el.tag:
             el.tag = el.tag.split("}", 1)[1]
-        # Also strip namespace from attributes
-        for attr_name in list(el.attrib.keys()):
-            if "}" in attr_name:
-                new_name = attr_name.split("}", 1)[1]
-                el.attrib[new_name] = el.attrib.pop(attr_name)
+
 
 def clean(val: str) -> str:
     """Clean column/table names"""
     if not val:
         return ""
-    # Remove brackets, quotes, and extra whitespace
-    cleaned = re.sub(r'[\[\]"\']', "", val).strip()
-    return cleaned
+    return re.sub(r'[\[\]"]', "", val).strip()
+
 
 def normalize_table_name(name: str) -> str:
-    """Normalize table names from various formats"""
+    """Normalize table names"""
     name = clean(name)
-    
-    # Handle Extract_tablename format
-    if name.startswith("Extract_"):
-        name = name.replace("Extract_", "")
-    
-    # Handle .csv_ suffix with hash
     if ".csv_" in name:
         return name.split(".csv_", 1)[0]
-    
-    # Handle .csv extension
-    if name.endswith(".csv"):
-        return name[:-4]
-    
-    # Remove common prefixes
-    for prefix in ["Extract.", "Custom SQL Query.", "federated."]:
-        if name.startswith(prefix):
-            name = name.replace(prefix, "")
-    
-    return name.lower()
+    return name
+
 
 def extract_hyper_metadata(hyper_path: str):
     """Extract table and column metadata from Hyper file"""
     tables: Dict[str, List[str]] = {}
     column_table_map: Dict[str, List[str]] = {}
 
-    try:
-        with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
-            with Connection(hyper.endpoint, hyper_path) as conn:
-                log.info("Connected to Hyper file successfully")
+    log.info(f"Opening Hyper file: {hyper_path}")
+    
+    with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
+        with Connection(hyper.endpoint, hyper_path) as conn:
+            schemas = conn.catalog.get_schema_names()
+            log.info(f"Found {len(schemas)} schema(s): {schemas}")
+            
+            for schema in schemas:
+                schema_tables = conn.catalog.get_table_names(schema)
+                log.info(f"Schema '{schema}' contains {len(schema_tables)} table(s)")
                 
-                # Get all schemas
-                schemas = conn.catalog.get_schema_names()
-                log.info(f"Found schemas: {schemas}")
-                
-                for schema in schemas:
-                    schema_tables = conn.catalog.get_table_names(schema)
-                    log.info(f"Schema '{schema}' has {len(schema_tables)} tables")
-                    
-                    for table in schema_tables:
-                        # Get the raw table name
-                        raw_table_name = str(table.name)
-                        table_name = normalize_table_name(raw_table_name)
-                        
-                        log.info(f"Processing table: {raw_table_name} -> {table_name}")
-                        
-                        cols = []
-                        table_def = conn.catalog.get_table_definition(table)
-                        
-                        for c in table_def.columns:
-                            col = clean(str(c.name))
-                            cols.append(col)
-                            column_table_map.setdefault(col, []).append(table_name)
-                        
-                        tables[table_name] = cols
-                        log.info(f"  Columns: {cols}")
+                for table in schema_tables:
+                    table_name = normalize_table_name(str(table.name))
+                    cols = []
 
-        log.info(f"Total tables extracted: {list(tables.keys())}")
-        log.info(f"Column to table mapping: {dict(column_table_map)}")
-        
-    except Exception as e:
-        log.error(f"Error extracting Hyper metadata: {str(e)}")
-        raise
+                    table_def = conn.catalog.get_table_definition(table)
+                    for c in table_def.columns:
+                        col = clean(str(c.name))
+                        cols.append(col)
+                        column_table_map.setdefault(col, []).append(table_name)
 
+                    tables[table_name] = cols
+                    log.info(f"  Table '{table_name}' has columns: {cols}")
+
+    log.info(f"HYPER EXTRACTION COMPLETE:")
+    log.info(f"  Total tables: {len(tables)}")
+    log.info(f"  Tables: {list(tables.keys())}")
+    log.info(f"  Column-to-table map: {dict(column_table_map)}")
+    
     return tables, column_table_map
 
-def extract_relationships_from_xml(root: ET.Element, column_table_map: Dict[str, List[str]]) -> List[Dict]:
-    """Extract relationships from TWB XML using multiple strategies"""
+
+def extract_relationships(root, column_table_map, tables):
+    """Extract relationships from XML (working version)"""
     relationships = []
     seen = set()
 
-    def add_relationship(from_t: str, from_c: str, to_t: str, to_c: str):
-        """Add a relationship if not already seen"""
-        from_t = from_t.lower()
-        to_t = to_t.lower()
-        
-        key = tuple(sorted([(from_t, from_c), (to_t, to_c)]))
+    def add(from_t, from_c, to_t, to_c):
+        key = (from_t, from_c, to_t, to_c)
         if key in seen:
-            return False
-        
+            return
         seen.add(key)
         relationships.append({
-            "fromTable": from_t,
+            "fromTable": from_t.lower(),
             "fromColumn": from_c,
-            "toTable": to_t,
+            "toTable": to_t.lower(),
             "toColumn": to_c,
             "relationshipType": "Many-to-One"
         })
-        log.info(f"Found relationship: {from_t}.{from_c} -> {to_t}.{to_c}")
-        return True
+        log.info(f"  Added relationship: {from_t}.{from_c} -> {to_t}.{to_c}")
 
-    # Strategy 1: Look for explicit relationship definitions
-    log.info("Strategy 1: Searching for explicit relationships in XML...")
-    for rel in root.findall(".//relationship"):
-        try:
-            # Try to get relationship attributes
-            rel_type = rel.get("type", "")
-            
-            # Look for expression elements
-            expressions = rel.findall(".//expression")
-            if len(expressions) >= 2:
-                cols = []
-                for expr in expressions:
-                    # Try multiple attribute names
-                    col = expr.get("op") or expr.get("name") or expr.text
-                    if col:
-                        col = clean(col)
-                        cols.append(col)
-                
-                if len(cols) >= 2:
-                    left_col, right_col = cols[0], cols[1]
-                    left_tables = column_table_map.get(left_col, [])
-                    right_tables = column_table_map.get(right_col, [])
-                    
-                    if left_tables and right_tables:
-                        add_relationship(left_tables[0], left_col, right_tables[0], right_col)
-        except Exception as e:
-            log.warning(f"Error parsing relationship: {e}")
-
-    # Strategy 2: Look for join clauses in datasource connections
-    log.info("Strategy 2: Searching for joins in datasource connections...")
-    for relation in root.findall(".//relation"):
-        join_type = relation.get("join", "")
-        if join_type:
-            # Look for join conditions
-            for clause in relation.findall(".//clause"):
-                clause_type = clause.get("type", "")
-                if clause_type == "join":
-                    expressions = clause.findall(".//expression")
-                    if len(expressions) >= 2:
-                        cols = []
-                        for expr in expressions:
-                            col = expr.get("op") or expr.text
-                            if col:
-                                col = clean(col)
-                                cols.append(col)
-                        
-                        if len(cols) >= 2:
-                            left_col, right_col = cols[0], cols[1]
-                            left_tables = column_table_map.get(left_col, [])
-                            right_tables = column_table_map.get(right_col, [])
-                            
-                            if left_tables and right_tables:
-                                add_relationship(left_tables[0], left_col, right_tables[0], right_col)
-
-    # Strategy 3: Look for column references in calculations
-    log.info("Strategy 3: Analyzing calculation fields...")
-    for calc in root.findall(".//column[@caption]"):
-        formula = calc.find(".//calculation")
-        if formula is not None:
-            formula_text = formula.get("formula", "")
-            if formula_text:
-                # Look for field references like [TableName].[ColumnName]
-                field_refs = re.findall(r'\[([^\]]+)\]\.\[([^\]]+)\]', formula_text)
-                if len(field_refs) >= 2:
-                    for i in range(len(field_refs) - 1):
-                        table1, col1 = field_refs[i]
-                        table2, col2 = field_refs[i + 1]
-                        
-                        table1 = normalize_table_name(table1)
-                        table2 = normalize_table_name(table2)
-                        
-                        if table1 != table2:
-                            add_relationship(table1, col1, table2, col2)
-
-    # Strategy 4: Look for metadata records
-    log.info("Strategy 4: Searching metadata records...")
-    for metadata_record in root.findall(".//metadata-record"):
-        remote_name = metadata_record.get("remote-name", "")
-        parent_name = metadata_record.find(".//parent-name")
-        
-        if remote_name and parent_name is not None:
-            parent = parent_name.text or parent_name.get("name", "")
-            if parent and remote_name != parent:
-                # These might be related columns
-                for table1, cols1 in column_table_map.items():
-                    if clean(remote_name) in [clean(c) for c in cols1]:
-                        for table2, cols2 in column_table_map.items():
-                            if table1 != table2 and clean(parent) in [clean(c) for c in cols2]:
-                                add_relationship(table1, clean(remote_name), table2, clean(parent))
-
-    return relationships
-
-def infer_relationships_from_schema(tables: Dict[str, List[str]], column_table_map: Dict[str, List[str]]) -> List[Dict]:
-    """Infer relationships based on common naming patterns and schema analysis"""
-    relationships = []
-    seen = set()
-
-    def add_relationship(from_t: str, from_c: str, to_t: str, to_c: str):
-        from_t = from_t.lower()
-        to_t = to_t.lower()
-        
-        key = tuple(sorted([(from_t, from_c), (to_t, to_c)]))
-        if key in seen:
-            return False
-        
-        seen.add(key)
-        relationships.append({
-            "fromTable": from_t,
-            "fromColumn": from_c,
-            "toTable": to_t,
-            "toColumn": to_c,
-            "relationshipType": "Many-to-One"
-        })
-        log.info(f"Inferred relationship: {from_t}.{from_c} -> {to_t}.{to_c}")
-        return True
-
-    log.info("Inferring relationships from schema patterns...")
+    # -------- XML relationships (object-graph) --------
+    log.info("Searching for XML relationships in object-graph...")
+    object_graph_rels = root.findall(".//object-graph/relationships/relationship")
+    log.info(f"Found {len(object_graph_rels)} relationship elements in object-graph")
     
-    # Strategy 1: Look for foreign key patterns (table_id in other tables)
-    table_list = list(tables.items())
-    for i, (table1, cols1) in enumerate(table_list):
-        for table2, cols2 in table_list[i + 1:]:
-            # Check if table1 has table2_id or vice versa
-            for col in cols1:
-                col_lower = col.lower()
-                # Check if this column references table2
-                if col_lower == f"{table2}_id" or col_lower == f"{table2}id":
-                    # Find the primary key column in table2 (usually 'id' or 'table2_id')
-                    pk_candidates = [c for c in cols2 if c.lower() in ['id', f"{table2}_id", f"{table2}id"]]
-                    if pk_candidates:
-                        add_relationship(table1, col, table2, pk_candidates[0])
-                    else:
-                        add_relationship(table1, col, table2, col)
-            
-            for col in cols2:
-                col_lower = col.lower()
-                if col_lower == f"{table1}_id" or col_lower == f"{table1}id":
-                    pk_candidates = [c for c in cols1 if c.lower() in ['id', f"{table1}_id", f"{table1}id"]]
-                    if pk_candidates:
-                        add_relationship(table2, col, table1, pk_candidates[0])
-                    else:
-                        add_relationship(table2, col, table1, col)
+    for rel in object_graph_rels:
+        expr = rel.find("expression")
+        if expr is None:
+            log.debug("  Skipping relationship: no expression element")
+            continue
 
-    # Strategy 2: Common column names (same name in multiple tables)
-    for col, table_names in column_table_map.items():
-        if len(table_names) >= 2:
-            # Connect tables that share this column
-            for i in range(len(table_names)):
-                for j in range(i + 1, len(table_names)):
-                    add_relationship(table_names[i], col, table_names[j], col)
+        cols = [clean(e.get("op")) for e in expr.findall("expression") if e.get("op")]
+        log.info(f"  Found expression columns: {cols}")
+        
+        if len(cols) != 2:
+            log.debug(f"  Skipping: expected 2 columns, got {len(cols)}")
+            continue
 
+        left, right = cols
+        lt = column_table_map.get(left, [])
+        rt = column_table_map.get(right, [])
+
+        log.info(f"  Column '{left}' found in tables: {lt}")
+        log.info(f"  Column '{right}' found in tables: {rt}")
+
+        if lt and rt:
+            add(lt[0], left, rt[0], right)
+        else:
+            log.warning(f"  Could not map columns to tables: {left} -> {right}")
+
+    # -------- Fallback: common column heuristic --------
+    if not relationships:
+        log.info("No XML relationships found. Using common column heuristic...")
+        table_items = list(tables.items())
+        for i, (t1, cols1) in enumerate(table_items):
+            for t2, cols2 in table_items[i + 1:]:
+                common = set(cols1) & set(cols2)
+                if common:
+                    log.info(f"  Tables '{t1}' and '{t2}' share columns: {common}")
+                    for col in common:
+                        add(t1, col, t2, col)
+
+    log.info(f"RELATIONSHIP EXTRACTION COMPLETE: {len(relationships)} relationship(s) found")
     return relationships
+
 
 def extract_metadata_from_twbx(twbx_path: str):
-    """Extract comprehensive metadata from TWBX file"""
+    """Extract metadata from TWBX file (working version)"""
+    log.info("=" * 80)
+    log.info("STARTING TWBX METADATA EXTRACTION")
+    log.info("=" * 80)
+    log.info(f"TWBX file: {twbx_path}")
+    
     with tempfile.TemporaryDirectory() as tmp:
-        # Extract TWBX
+        log.info(f"Extracting TWBX to temporary directory: {tmp}")
+        
         with zipfile.ZipFile(twbx_path, "r") as z:
             z.extractall(tmp)
-            log.info(f"Extracted TWBX to {tmp}")
-            log.info(f"Contents: {os.listdir(tmp)}")
 
-        # Find TWB and Hyper files
-        twb_path = hyper_path = None
-        for root_dir, dirs, files in os.walk(tmp):
+        # List extracted files
+        all_files = []
+        for root_dir, _, files in os.walk(tmp):
             for f in files:
-                full_path = os.path.join(root_dir, f)
-                if f.endswith(".twb"):
-                    twb_path = full_path
-                    log.info(f"Found TWB: {twb_path}")
-                elif f.endswith(".hyper"):
-                    hyper_path = full_path
-                    log.info(f"Found Hyper: {hyper_path}")
+                rel_path = os.path.relpath(os.path.join(root_dir, f), tmp)
+                all_files.append(rel_path)
+        log.info(f"Extracted files: {all_files}")
 
-        if not twb_path or not hyper_path:
+        twb = hyper = None
+        for root_dir, _, files in os.walk(tmp):
+            for f in files:
+                if f.endswith(".twb"):
+                    twb = os.path.join(root_dir, f)
+                    log.info(f"Found TWB file: {twb}")
+                elif f.endswith(".hyper"):
+                    hyper = os.path.join(root_dir, f)
+                    log.info(f"Found Hyper file: {hyper}")
+
+        if not twb or not hyper:
             raise ValueError("Invalid TWBX file: missing .twb or .hyper")
 
-        # Parse TWB XML
-        tree = ET.parse(twb_path)
+        log.info("Parsing TWB XML...")
+        tree = ET.parse(twb)
         root = tree.getroot()
+        
+        log.info(f"XML root element: <{root.tag}> with {len(root)} children")
+        
+        log.info("Stripping XML namespaces...")
         strip_ns(root)
 
-        # Extract metadata from Hyper
-        tables, col_map = extract_hyper_metadata(hyper_path)
-        
-        if not tables:
-            raise ValueError("No tables found in Hyper file")
+        log.info("Extracting Hyper metadata...")
+        tables, col_map = extract_hyper_metadata(hyper)
 
-        # Extract relationships using multiple strategies
-        log.info("=" * 60)
-        log.info("EXTRACTING RELATIONSHIPS")
-        log.info("=" * 60)
-        
-        relationships_from_xml = extract_relationships_from_xml(root, col_map)
-        log.info(f"Found {len(relationships_from_xml)} relationships from XML")
-        
-        # If no relationships found in XML, try to infer them
-        if not relationships_from_xml:
-            log.info("No explicit relationships found. Attempting to infer from schema...")
-            relationships = infer_relationships_from_schema(tables, col_map)
-        else:
-            relationships = relationships_from_xml
+        log.info("Extracting relationships...")
+        relationships = extract_relationships(root, col_map, tables)
 
-        log.info("=" * 60)
-        log.info(f"TOTAL RELATIONSHIPS FOUND: {len(relationships)}")
-        log.info("=" * 60)
-        
+        log.info("=" * 80)
+        log.info("EXTRACTION SUMMARY")
+        log.info("=" * 80)
+        log.info(f"Tables found: {len(tables)}")
+        log.info(f"Relationships found: {len(relationships)}")
         for r in relationships:
-            log.info(f"  {r['fromTable']}.{r['fromColumn']} -> {r['toTable']}.{r['toColumn']}")
+            log.info(f"  - {r['fromTable']}.{r['fromColumn']} -> {r['toTable']}.{r['toColumn']}")
+        log.info("=" * 80)
 
         return {
             "relationships": relationships,
@@ -1117,16 +977,40 @@ def migrate(folder_name: str, target_workspace_id: str):
         # 4️⃣ BUILD POWER BI RELATIONSHIPS
         pbi_relationships = []
         for r in relationships_metadata:
-            if r["fromTable"] in blob_tables and r["toTable"] in blob_tables:
-                pbi_relationships.append({
-                    "name": f"{r['fromTable']}_{r['toTable']}",
-                    "fromTable": r["fromTable"],
-                    "fromColumn": r["fromColumn"],
-                    "toTable": r["toTable"],
-                    "toColumn": r["toColumn"],
-                    "crossFilteringBehavior": "BothDirections",
-                })
-                log.info(f"✅ Created PBI relationship: {r['fromTable']}.{r['fromColumn']} -> {r['toTable']}.{r['toColumn']}")
+            from_table = r["fromTable"]
+            to_table = r["toTable"]
+            from_col = r["fromColumn"]
+            to_col = r["toColumn"]
+            
+            # Validate both tables exist
+            if from_table not in blob_tables or to_table not in blob_tables:
+                log.warning(f"⚠️ Skipping relationship {from_table}.{from_col} -> {to_table}.{to_col}: table not found")
+                continue
+            
+            # Validate columns exist in the actual data
+            from_df = blob_tables[from_table]
+            to_df = blob_tables[to_table]
+            
+            if from_col not in from_df.columns:
+                log.warning(f"⚠️ Skipping relationship: column '{from_col}' not found in table '{from_table}'")
+                log.info(f"   Available columns in {from_table}: {list(from_df.columns)}")
+                continue
+                
+            if to_col not in to_df.columns:
+                log.warning(f"⚠️ Skipping relationship: column '{to_col}' not found in table '{to_table}'")
+                log.info(f"   Available columns in {to_table}: {list(to_df.columns)}")
+                continue
+            
+            # All validations passed - add the relationship
+            pbi_relationships.append({
+                "name": f"{from_table}_{to_table}",
+                "fromTable": from_table,
+                "fromColumn": from_col,
+                "toTable": to_table,
+                "toColumn": to_col,
+                "crossFilteringBehavior": "BothDirections",
+            })
+            log.info(f"✅ Validated relationship: {from_table}.{from_col} -> {to_table}.{to_col}")
 
         # 5️⃣ CREATE DATASET
         dataset_payload = {
@@ -1138,6 +1022,9 @@ def migrate(folder_name: str, target_workspace_id: str):
         # Only add relationships if we have valid ones
         if pbi_relationships:
             dataset_payload["relationships"] = pbi_relationships
+            log.info(f"Adding {len(pbi_relationships)} relationships to dataset")
+        else:
+            log.info("No relationships to add to dataset")
 
         for table_name, df in blob_tables.items():
             columns = []
@@ -1170,20 +1057,31 @@ def migrate(folder_name: str, target_workspace_id: str):
         log.info(f"Dataset payload: {json.dumps(dataset_payload, indent=2)}")
 
         # Create dataset
-        ds_resp = requests.post(
-            f"{POWERBI_API}/groups/{target_workspace_id}/datasets",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            },
-            json=dataset_payload,
-        )
-        
-        if not ds_resp.ok:
-            log.error(f"Dataset creation failed: {ds_resp.status_code}")
-            log.error(f"Response: {ds_resp.text}")
-        
-        ds_resp.raise_for_status()
+        try:
+            ds_resp = requests.post(
+                f"{POWERBI_API}/groups/{target_workspace_id}/datasets",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json"
+                },
+                json=dataset_payload,
+            )
+            
+            if not ds_resp.ok:
+                log.error(f"❌ Dataset creation failed: {ds_resp.status_code}")
+                log.error(f"Response body: {ds_resp.text}")
+                log.error(f"Request payload was: {json.dumps(dataset_payload, indent=2)}")
+            
+            ds_resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            log.error(f"Power BI API Error Details:")
+            log.error(f"  Status Code: {ds_resp.status_code}")
+            log.error(f"  Response: {ds_resp.text}")
+            log.error(f"  Payload sent: {json.dumps(dataset_payload, indent=2)}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Power BI dataset creation failed: {ds_resp.text}"
+            )
         dataset_id = ds_resp.json()["id"]
         log.info(f"✅ Dataset created: {dataset_id}")
 
@@ -1246,6 +1144,154 @@ def migrate(folder_name: str, target_workspace_id: str):
 @app.get("/health")
 def health():
     return {"status": "healthy"}
+
+
+@app.post("/diagnose-twbx")
+def diagnose_twbx_endpoint(folder_name: str):
+    """
+    Diagnostic endpoint to examine TWBX structure and find why relationships aren't extracted
+    """
+    try:
+        import io
+        from contextlib import redirect_stdout
+        
+        # Download TWBX
+        twbx_path = download_twbx_from_blob(folder_name)
+        log.info(f"Downloaded TWBX for diagnostics: {twbx_path}")
+        
+        # Capture diagnostic output
+        output = io.StringIO()
+        
+        with tempfile.TemporaryDirectory() as tmp:
+            # Extract TWBX
+            with zipfile.ZipFile(twbx_path, "r") as z:
+                z.extractall(tmp)
+            
+            # Find files
+            twb_path = hyper_path = None
+            all_files = []
+            for root_dir, dirs, files in os.walk(tmp):
+                for f in files:
+                    full_path = os.path.join(root_dir, f)
+                    rel_path = os.path.relpath(full_path, tmp)
+                    all_files.append(rel_path)
+                    if f.endswith(".twb"):
+                        twb_path = full_path
+                    elif f.endswith(".hyper"):
+                        hyper_path = full_path
+            
+            diagnostic_info = {
+                "files_in_twbx": all_files,
+                "twb_file": os.path.basename(twb_path) if twb_path else None,
+                "hyper_file": os.path.basename(hyper_path) if hyper_path else None,
+                "xml_elements": {},
+                "hyper_tables": {},
+                "relationship_attempts": []
+            }
+            
+            if not twb_path or not hyper_path:
+                return {
+                    "status": "ERROR",
+                    "message": "Missing TWB or Hyper file",
+                    "diagnostic": diagnostic_info
+                }
+            
+            # Parse XML
+            tree = ET.parse(twb_path)
+            root = tree.getroot()
+            
+            # Count elements before namespace stripping
+            diagnostic_info["xml_elements"]["before_strip"] = {
+                "relationship": len(root.findall(".//relationship")),
+                "relationships": len(root.findall(".//relationships")),
+                "relation": len(root.findall(".//relation")),
+                "datasource": len(root.findall(".//datasource")),
+                "connection": len(root.findall(".//connection")),
+            }
+            
+            # Strip namespaces
+            strip_ns(root)
+            
+            # Count elements after namespace stripping
+            diagnostic_info["xml_elements"]["after_strip"] = {
+                "relationship": len(root.findall(".//relationship")),
+                "relationships": len(root.findall(".//relationships")),
+                "relation": len(root.findall(".//relation")),
+                "datasource": len(root.findall(".//datasource")),
+                "connection": len(root.findall(".//connection")),
+            }
+            
+            # Analyze relations (joins)
+            relations_info = []
+            for rel in root.findall(".//relation"):
+                rel_info = {
+                    "type": rel.get("type"),
+                    "name": rel.get("name"),
+                    "join": rel.get("join"),
+                    "clauses": []
+                }
+                
+                for clause in rel.findall(".//clause"):
+                    clause_info = {
+                        "type": clause.get("type"),
+                        "expressions": []
+                    }
+                    for expr in clause.findall(".//expression"):
+                        clause_info["expressions"].append({
+                            "op": expr.get("op"),
+                            "text": expr.text
+                        })
+                    if clause_info["expressions"]:
+                        rel_info["clauses"].append(clause_info)
+                
+                if rel_info["join"] or rel_info["clauses"]:
+                    relations_info.append(rel_info)
+            
+            diagnostic_info["relations_found"] = relations_info
+            
+            # Analyze Hyper
+            tables, col_map = extract_hyper_metadata(hyper_path)
+            diagnostic_info["hyper_tables"] = {
+                table: cols for table, cols in tables.items()
+            }
+            
+            # Try relationship extraction
+            log.info("Attempting XML relationship extraction...")
+            xml_relationships = extract_relationships_from_xml(root, col_map)
+            diagnostic_info["relationship_attempts"].append({
+                "method": "XML extraction",
+                "count": len(xml_relationships),
+                "relationships": xml_relationships
+            })
+            
+            log.info("Attempting schema inference...")
+            inferred_relationships = infer_relationships_from_schema(tables, col_map)
+            diagnostic_info["relationship_attempts"].append({
+                "method": "Schema inference",
+                "count": len(inferred_relationships),
+                "relationships": inferred_relationships
+            })
+            
+            os.remove(twbx_path)
+            
+            return {
+                "status": "SUCCESS",
+                "diagnostic": diagnostic_info,
+                "summary": {
+                    "total_tables": len(tables),
+                    "xml_relationships_found": len(xml_relationships),
+                    "inferred_relationships": len(inferred_relationships),
+                    "total_relationships": len(xml_relationships) + len(inferred_relationships)
+                }
+            }
+            
+    except Exception as e:
+        log.exception("Diagnostic failed")
+        return {
+            "status": "ERROR",
+            "error": str(e),
+            "traceback": str(e.__traceback__)
+        }
 
 
 if __name__ == "__main__":
