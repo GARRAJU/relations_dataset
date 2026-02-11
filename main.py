@@ -609,13 +609,13 @@ import requests
 import pandas as pd
 import json
 import xml.etree.ElementTree as ET
-from typing import Dict, List
+from typing import Dict, List, Set, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from azure.storage.blob import BlobServiceClient
 from dotenv import load_dotenv
-from tableauhyperapi import HyperProcess, Telemetry, Connection
+from tableauhyperapi import HyperProcess, Telemetry, Connection, TableName
 
 # ============================================================
 # ENV + CONFIG
@@ -660,113 +660,330 @@ app.add_middleware(
 )
 
 # ============================================================
-# EXTRACTOR LOGIC (from extractor.py)
+# ENHANCED EXTRACTOR LOGIC
 # ============================================================
 
 def strip_ns(root: ET.Element):
+    """Remove XML namespaces from all elements"""
     for el in root.iter():
         if "}" in el.tag:
             el.tag = el.tag.split("}", 1)[1]
+        # Also strip namespace from attributes
+        for attr_name in list(el.attrib.keys()):
+            if "}" in attr_name:
+                new_name = attr_name.split("}", 1)[1]
+                el.attrib[new_name] = el.attrib.pop(attr_name)
 
 def clean(val: str) -> str:
+    """Clean column/table names"""
     if not val:
         return ""
-    return re.sub(r'[\[\]"]', "", val).strip()
+    # Remove brackets, quotes, and extra whitespace
+    cleaned = re.sub(r'[\[\]"\']', "", val).strip()
+    return cleaned
 
 def normalize_table_name(name: str) -> str:
+    """Normalize table names from various formats"""
     name = clean(name)
+    
+    # Handle Extract_tablename format
+    if name.startswith("Extract_"):
+        name = name.replace("Extract_", "")
+    
+    # Handle .csv_ suffix with hash
     if ".csv_" in name:
         return name.split(".csv_", 1)[0]
-    return name
+    
+    # Handle .csv extension
+    if name.endswith(".csv"):
+        return name[:-4]
+    
+    # Remove common prefixes
+    for prefix in ["Extract.", "Custom SQL Query.", "federated."]:
+        if name.startswith(prefix):
+            name = name.replace(prefix, "")
+    
+    return name.lower()
 
 def extract_hyper_metadata(hyper_path: str):
+    """Extract table and column metadata from Hyper file"""
     tables: Dict[str, List[str]] = {}
     column_table_map: Dict[str, List[str]] = {}
 
-    with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
-        with Connection(hyper.endpoint, hyper_path) as conn:
-            for schema in conn.catalog.get_schema_names():
-                for table in conn.catalog.get_table_names(schema):
-                    table_name = normalize_table_name(str(table.name))
-                    cols = []
+    try:
+        with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
+            with Connection(hyper.endpoint, hyper_path) as conn:
+                log.info("Connected to Hyper file successfully")
+                
+                # Get all schemas
+                schemas = conn.catalog.get_schema_names()
+                log.info(f"Found schemas: {schemas}")
+                
+                for schema in schemas:
+                    schema_tables = conn.catalog.get_table_names(schema)
+                    log.info(f"Schema '{schema}' has {len(schema_tables)} tables")
+                    
+                    for table in schema_tables:
+                        # Get the raw table name
+                        raw_table_name = str(table.name)
+                        table_name = normalize_table_name(raw_table_name)
+                        
+                        log.info(f"Processing table: {raw_table_name} -> {table_name}")
+                        
+                        cols = []
+                        table_def = conn.catalog.get_table_definition(table)
+                        
+                        for c in table_def.columns:
+                            col = clean(str(c.name))
+                            cols.append(col)
+                            column_table_map.setdefault(col, []).append(table_name)
+                        
+                        tables[table_name] = cols
+                        log.info(f"  Columns: {cols}")
 
-                    table_def = conn.catalog.get_table_definition(table)
-                    for c in table_def.columns:
-                        col = clean(str(c.name))
-                        cols.append(col)
-                        column_table_map.setdefault(col, []).append(table_name)
-
-                    tables[table_name] = cols
+        log.info(f"Total tables extracted: {list(tables.keys())}")
+        log.info(f"Column to table mapping: {dict(column_table_map)}")
+        
+    except Exception as e:
+        log.error(f"Error extracting Hyper metadata: {str(e)}")
+        raise
 
     return tables, column_table_map
 
-def extract_relationships(root, column_table_map, tables):
+def extract_relationships_from_xml(root: ET.Element, column_table_map: Dict[str, List[str]]) -> List[Dict]:
+    """Extract relationships from TWB XML using multiple strategies"""
     relationships = []
     seen = set()
 
-    def add(from_t, from_c, to_t, to_c):
-        key = (from_t, from_c, to_t, to_c)
+    def add_relationship(from_t: str, from_c: str, to_t: str, to_c: str):
+        """Add a relationship if not already seen"""
+        from_t = from_t.lower()
+        to_t = to_t.lower()
+        
+        key = tuple(sorted([(from_t, from_c), (to_t, to_c)]))
         if key in seen:
-            return
+            return False
+        
         seen.add(key)
         relationships.append({
-            "fromTable": from_t.lower(),
+            "fromTable": from_t,
             "fromColumn": from_c,
-            "toTable": to_t.lower(),
+            "toTable": to_t,
             "toColumn": to_c,
             "relationshipType": "Many-to-One"
         })
+        log.info(f"Found relationship: {from_t}.{from_c} -> {to_t}.{to_c}")
+        return True
 
-    # XML relationships
-    for rel in root.findall(".//object-graph/relationships/relationship"):
-        expr = rel.find("expression")
-        if expr is None:
-            continue
+    # Strategy 1: Look for explicit relationship definitions
+    log.info("Strategy 1: Searching for explicit relationships in XML...")
+    for rel in root.findall(".//relationship"):
+        try:
+            # Try to get relationship attributes
+            rel_type = rel.get("type", "")
+            
+            # Look for expression elements
+            expressions = rel.findall(".//expression")
+            if len(expressions) >= 2:
+                cols = []
+                for expr in expressions:
+                    # Try multiple attribute names
+                    col = expr.get("op") or expr.get("name") or expr.text
+                    if col:
+                        col = clean(col)
+                        cols.append(col)
+                
+                if len(cols) >= 2:
+                    left_col, right_col = cols[0], cols[1]
+                    left_tables = column_table_map.get(left_col, [])
+                    right_tables = column_table_map.get(right_col, [])
+                    
+                    if left_tables and right_tables:
+                        add_relationship(left_tables[0], left_col, right_tables[0], right_col)
+        except Exception as e:
+            log.warning(f"Error parsing relationship: {e}")
 
-        cols = [clean(e.get("op")) for e in expr.findall("expression")]
-        if len(cols) != 2:
-            continue
+    # Strategy 2: Look for join clauses in datasource connections
+    log.info("Strategy 2: Searching for joins in datasource connections...")
+    for relation in root.findall(".//relation"):
+        join_type = relation.get("join", "")
+        if join_type:
+            # Look for join conditions
+            for clause in relation.findall(".//clause"):
+                clause_type = clause.get("type", "")
+                if clause_type == "join":
+                    expressions = clause.findall(".//expression")
+                    if len(expressions) >= 2:
+                        cols = []
+                        for expr in expressions:
+                            col = expr.get("op") or expr.text
+                            if col:
+                                col = clean(col)
+                                cols.append(col)
+                        
+                        if len(cols) >= 2:
+                            left_col, right_col = cols[0], cols[1]
+                            left_tables = column_table_map.get(left_col, [])
+                            right_tables = column_table_map.get(right_col, [])
+                            
+                            if left_tables and right_tables:
+                                add_relationship(left_tables[0], left_col, right_tables[0], right_col)
 
-        left, right = cols
-        lt = column_table_map.get(left, [])
-        rt = column_table_map.get(right, [])
+    # Strategy 3: Look for column references in calculations
+    log.info("Strategy 3: Analyzing calculation fields...")
+    for calc in root.findall(".//column[@caption]"):
+        formula = calc.find(".//calculation")
+        if formula is not None:
+            formula_text = formula.get("formula", "")
+            if formula_text:
+                # Look for field references like [TableName].[ColumnName]
+                field_refs = re.findall(r'\[([^\]]+)\]\.\[([^\]]+)\]', formula_text)
+                if len(field_refs) >= 2:
+                    for i in range(len(field_refs) - 1):
+                        table1, col1 = field_refs[i]
+                        table2, col2 = field_refs[i + 1]
+                        
+                        table1 = normalize_table_name(table1)
+                        table2 = normalize_table_name(table2)
+                        
+                        if table1 != table2:
+                            add_relationship(table1, col1, table2, col2)
 
-        if lt and rt:
-            add(lt[0], left, rt[0], right)
+    # Strategy 4: Look for metadata records
+    log.info("Strategy 4: Searching metadata records...")
+    for metadata_record in root.findall(".//metadata-record"):
+        remote_name = metadata_record.get("remote-name", "")
+        parent_name = metadata_record.find(".//parent-name")
+        
+        if remote_name and parent_name is not None:
+            parent = parent_name.text or parent_name.get("name", "")
+            if parent and remote_name != parent:
+                # These might be related columns
+                for table1, cols1 in column_table_map.items():
+                    if clean(remote_name) in [clean(c) for c in cols1]:
+                        for table2, cols2 in column_table_map.items():
+                            if table1 != table2 and clean(parent) in [clean(c) for c in cols2]:
+                                add_relationship(table1, clean(remote_name), table2, clean(parent))
 
-    # Fallback: common column heuristic
-    if not relationships:
-        table_items = list(tables.items())
-        for i, (t1, cols1) in enumerate(table_items):
-            for t2, cols2 in table_items[i + 1:]:
-                common = set(cols1) & set(cols2)
-                for col in common:
-                    add(t1, col, t2, col)
+    return relationships
+
+def infer_relationships_from_schema(tables: Dict[str, List[str]], column_table_map: Dict[str, List[str]]) -> List[Dict]:
+    """Infer relationships based on common naming patterns and schema analysis"""
+    relationships = []
+    seen = set()
+
+    def add_relationship(from_t: str, from_c: str, to_t: str, to_c: str):
+        from_t = from_t.lower()
+        to_t = to_t.lower()
+        
+        key = tuple(sorted([(from_t, from_c), (to_t, to_c)]))
+        if key in seen:
+            return False
+        
+        seen.add(key)
+        relationships.append({
+            "fromTable": from_t,
+            "fromColumn": from_c,
+            "toTable": to_t,
+            "toColumn": to_c,
+            "relationshipType": "Many-to-One"
+        })
+        log.info(f"Inferred relationship: {from_t}.{from_c} -> {to_t}.{to_c}")
+        return True
+
+    log.info("Inferring relationships from schema patterns...")
+    
+    # Strategy 1: Look for foreign key patterns (table_id in other tables)
+    table_list = list(tables.items())
+    for i, (table1, cols1) in enumerate(table_list):
+        for table2, cols2 in table_list[i + 1:]:
+            # Check if table1 has table2_id or vice versa
+            for col in cols1:
+                col_lower = col.lower()
+                # Check if this column references table2
+                if col_lower == f"{table2}_id" or col_lower == f"{table2}id":
+                    # Find the primary key column in table2 (usually 'id' or 'table2_id')
+                    pk_candidates = [c for c in cols2 if c.lower() in ['id', f"{table2}_id", f"{table2}id"]]
+                    if pk_candidates:
+                        add_relationship(table1, col, table2, pk_candidates[0])
+                    else:
+                        add_relationship(table1, col, table2, col)
+            
+            for col in cols2:
+                col_lower = col.lower()
+                if col_lower == f"{table1}_id" or col_lower == f"{table1}id":
+                    pk_candidates = [c for c in cols1 if c.lower() in ['id', f"{table1}_id", f"{table1}id"]]
+                    if pk_candidates:
+                        add_relationship(table2, col, table1, pk_candidates[0])
+                    else:
+                        add_relationship(table2, col, table1, col)
+
+    # Strategy 2: Common column names (same name in multiple tables)
+    for col, table_names in column_table_map.items():
+        if len(table_names) >= 2:
+            # Connect tables that share this column
+            for i in range(len(table_names)):
+                for j in range(i + 1, len(table_names)):
+                    add_relationship(table_names[i], col, table_names[j], col)
 
     return relationships
 
 def extract_metadata_from_twbx(twbx_path: str):
+    """Extract comprehensive metadata from TWBX file"""
     with tempfile.TemporaryDirectory() as tmp:
+        # Extract TWBX
         with zipfile.ZipFile(twbx_path, "r") as z:
             z.extractall(tmp)
+            log.info(f"Extracted TWBX to {tmp}")
+            log.info(f"Contents: {os.listdir(tmp)}")
 
-        twb = hyper = None
-        for root_dir, _, files in os.walk(tmp):
+        # Find TWB and Hyper files
+        twb_path = hyper_path = None
+        for root_dir, dirs, files in os.walk(tmp):
             for f in files:
+                full_path = os.path.join(root_dir, f)
                 if f.endswith(".twb"):
-                    twb = os.path.join(root_dir, f)
+                    twb_path = full_path
+                    log.info(f"Found TWB: {twb_path}")
                 elif f.endswith(".hyper"):
-                    hyper = os.path.join(root_dir, f)
+                    hyper_path = full_path
+                    log.info(f"Found Hyper: {hyper_path}")
 
-        if not twb or not hyper:
+        if not twb_path or not hyper_path:
             raise ValueError("Invalid TWBX file: missing .twb or .hyper")
 
-        tree = ET.parse(twb)
+        # Parse TWB XML
+        tree = ET.parse(twb_path)
         root = tree.getroot()
         strip_ns(root)
 
-        tables, col_map = extract_hyper_metadata(hyper)
-        relationships = extract_relationships(root, col_map, tables)
+        # Extract metadata from Hyper
+        tables, col_map = extract_hyper_metadata(hyper_path)
+        
+        if not tables:
+            raise ValueError("No tables found in Hyper file")
+
+        # Extract relationships using multiple strategies
+        log.info("=" * 60)
+        log.info("EXTRACTING RELATIONSHIPS")
+        log.info("=" * 60)
+        
+        relationships_from_xml = extract_relationships_from_xml(root, col_map)
+        log.info(f"Found {len(relationships_from_xml)} relationships from XML")
+        
+        # If no relationships found in XML, try to infer them
+        if not relationships_from_xml:
+            log.info("No explicit relationships found. Attempting to infer from schema...")
+            relationships = infer_relationships_from_schema(tables, col_map)
+        else:
+            relationships = relationships_from_xml
+
+        log.info("=" * 60)
+        log.info(f"TOTAL RELATIONSHIPS FOUND: {len(relationships)}")
+        log.info("=" * 60)
+        
+        for r in relationships:
+            log.info(f"  {r['fromTable']}.{r['fromColumn']} -> {r['toTable']}.{r['toColumn']}")
 
         return {
             "relationships": relationships,
@@ -778,12 +995,25 @@ def extract_metadata_from_twbx(twbx_path: str):
 # ============================================================
 
 def extract_second_word_table_name(filename: str) -> str:
+    """Extract table name from CSV filename"""
     base = filename.split(".csv")[0]
+    
+    # Handle Extract_tablename format
+    if base.startswith("Extract_"):
+        base = base.replace("Extract_", "")
+        # Remove hash suffix if present
+        parts = base.split("_")
+        if len(parts) > 1 and len(parts[-1]) > 20:  # Likely a hash
+            base = "_".join(parts[:-1])
+        return re.sub(r"[^a-zA-Z]", "", base).lower()
+    
+    # Handle other formats
     parts = base.split("_")
     table_name = parts[1] if len(parts) >= 2 else parts[0]
     return re.sub(r"[^a-zA-Z]", "", table_name).lower()
 
 def get_auth_token() -> str:
+    """Get Power BI authentication token"""
     url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 
     resp = requests.post(
@@ -799,6 +1029,7 @@ def get_auth_token() -> str:
     return resp.json()["access_token"]
 
 def download_twbx_from_blob(folder_name: str) -> str:
+    """Download TWBX file from Azure Blob Storage"""
     blob_service = BlobServiceClient.from_connection_string(
         AZURE_STORAGE_CONNECTION_STRING
     )
@@ -833,15 +1064,14 @@ def migrate(folder_name: str, target_workspace_id: str):
         metadata = extract_metadata_from_twbx(twbx_path)
         os.remove(twbx_path)
 
-        # Use dynamic relationships
-        relationships_metadata = metadata.get("relationships")
+        # Get relationships
+        relationships_metadata = metadata.get("relationships", [])
         if relationships_metadata:
             log.info(f"✅ Extracted {len(relationships_metadata)} relationships from TWBX:")
             for r in relationships_metadata:
                 log.info(f"  {r['fromTable']}.{r['fromColumn']} -> {r['toTable']}.{r['toColumn']}")
         else:
             log.warning("⚠️ No relationships found in TWBX. Migration will continue without relationships.")
-            relationships_metadata = []
 
         # 3️⃣ READ CSVs FROM AZURE BLOB
         blob_service = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
@@ -850,11 +1080,17 @@ def migrate(folder_name: str, target_workspace_id: str):
         blob_tables = {}
         prefix = f"{folder_name.rstrip('/')}/"
 
+        # Get valid tables from relationships
         valid_tables = set()
         for r in relationships_metadata:
             valid_tables.add(r["fromTable"])
             valid_tables.add(r["toTable"])
-        log.info(f"Valid tables from relationships: {valid_tables}")
+        
+        # Also include all tables from metadata
+        for table_name in metadata.get("tables", {}).keys():
+            valid_tables.add(table_name)
+        
+        log.info(f"Valid tables to load: {valid_tables}")
 
         all_blobs = list(container.list_blobs(name_starts_with=prefix))
         log.info(f"Found {len(all_blobs)} blobs with prefix '{prefix}'")
@@ -865,15 +1101,15 @@ def migrate(folder_name: str, target_workspace_id: str):
                 continue
 
             table_name = extract_second_word_table_name(filename)
-            if valid_tables and table_name not in valid_tables:
-                continue
-
-            try:
-                data = container.download_blob(blob.name).readall()
-                blob_tables[table_name] = pd.read_csv(pd.io.common.BytesIO(data))
-                log.info(f"Loaded table: {table_name}")
-            except Exception as e:
-                log.error(f"Failed to load {table_name}: {str(e)}")
+            
+            # Load table if it's in valid_tables or if no relationships exist (load all)
+            if not valid_tables or table_name in valid_tables:
+                try:
+                    data = container.download_blob(blob.name).readall()
+                    blob_tables[table_name] = pd.read_csv(pd.io.common.BytesIO(data))
+                    log.info(f"✅ Loaded table: {table_name} ({len(blob_tables[table_name])} rows)")
+                except Exception as e:
+                    log.error(f"Failed to load {table_name}: {str(e)}")
 
         if not blob_tables:
             raise Exception(f"No CSV tables loaded for folder: {prefix}")
@@ -890,24 +1126,33 @@ def migrate(folder_name: str, target_workspace_id: str):
                     "toColumn": r["toColumn"],
                     "crossFilteringBehavior": "BothDirections",
                 })
+                log.info(f"✅ Created PBI relationship: {r['fromTable']}.{r['fromColumn']} -> {r['toTable']}.{r['toColumn']}")
 
         # 5️⃣ CREATE DATASET
         dataset_payload = {
             "name": f"{REPORT_NAME}_DS",
             "tables": [],
-            "relationships": pbi_relationships if pbi_relationships else None,
             "defaultMode": "Push",
         }
+        
+        # Only add relationships if we have valid ones
+        if pbi_relationships:
+            dataset_payload["relationships"] = pbi_relationships
 
         for table_name, df in blob_tables.items():
             columns = []
             for col in df.columns:
-                if "id" in col.lower():
+                col_lower = col.lower()
+                
+                # Determine data type and summarization
+                if "id" in col_lower:
                     dtype, summarize = "Int64", "none"
                 elif df[col].dtype == "float64":
                     dtype, summarize = "Double", "sum"
                 elif df[col].dtype == "int64":
                     dtype, summarize = "Int64", "sum"
+                elif pd.api.types.is_datetime64_any_dtype(df[col]):
+                    dtype, summarize = "DateTime", "none"
                 else:
                     dtype, summarize = "String", "none"
 
@@ -922,6 +1167,9 @@ def migrate(folder_name: str, target_workspace_id: str):
                 "columns": columns,
             })
 
+        log.info(f"Dataset payload: {json.dumps(dataset_payload, indent=2)}")
+
+        # Create dataset
         ds_resp = requests.post(
             f"{POWERBI_API}/groups/{target_workspace_id}/datasets",
             headers={
@@ -930,6 +1178,11 @@ def migrate(folder_name: str, target_workspace_id: str):
             },
             json=dataset_payload,
         )
+        
+        if not ds_resp.ok:
+            log.error(f"Dataset creation failed: {ds_resp.status_code}")
+            log.error(f"Response: {ds_resp.text}")
+        
         ds_resp.raise_for_status()
         dataset_id = ds_resp.json()["id"]
         log.info(f"✅ Dataset created: {dataset_id}")
@@ -937,17 +1190,28 @@ def migrate(folder_name: str, target_workspace_id: str):
         # 6️⃣ PUSH DATA
         time.sleep(5)
         for table_name, df in blob_tables.items():
+            # Convert DataFrame to records
             rows = df.where(pd.notnull(df), None).to_dict(orient="records")
-            for i in range(0, len(rows), 2500):
-                requests.post(
+            
+            # Push in batches
+            batch_size = 2500
+            for i in range(0, len(rows), batch_size):
+                batch = rows[i:i + batch_size]
+                push_resp = requests.post(
                     f"{POWERBI_API}/groups/{target_workspace_id}/datasets/{dataset_id}/tables/{table_name}/rows",
                     headers={
                         "Authorization": f"Bearer {token}",
                         "Content-Type": "application/json"
                     },
-                    json={"rows": rows[i:i + 2500]},
-                ).raise_for_status()
-            log.info(f"Pushed {len(rows)} rows into {table_name}")
+                    json={"rows": batch},
+                )
+                
+                if not push_resp.ok:
+                    log.error(f"Failed to push batch to {table_name}: {push_resp.text}")
+                
+                push_resp.raise_for_status()
+            
+            log.info(f"✅ Pushed {len(rows)} rows into {table_name}")
 
         # 7️⃣ CLONE REPORT
         clone_resp = requests.post(
@@ -969,9 +1233,9 @@ def migrate(folder_name: str, target_workspace_id: str):
             "dataset_id": dataset_id,
             "report_id": clone_resp.json()["id"],
             "tables_migrated": list(blob_tables.keys()),
-            "relationships_created": len(pbi_relationships) > 0,
+            "relationships_created": len(pbi_relationships),
             "relationships": relationships_metadata,
-            "message": "TWBX metadata + data migrated successfully with extracted relationships"
+            "message": f"TWBX migrated successfully with {len(pbi_relationships)} relationships"
         }
 
     except Exception as e:
@@ -983,3 +1247,7 @@ def migrate(folder_name: str, target_workspace_id: str):
 def health():
     return {"status": "healthy"}
 
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
